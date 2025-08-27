@@ -8,7 +8,7 @@
 
 ## Badge
 
-[![GitHub](https://img.shields.io/github/license/rfxlamia/legalpdf-to-md)](https://github.com/rfxlamia/legalpdf-to-md/blob/main/LICENSE)
+[![GitHub](https://img.shields.io/github/license/rfxlamia/legalpdf-to-md)](https://img.shields.io/github/license/rfxlamia/legalpdf-to-md)
 [![Rust](https://img.shields.io/badge/Rust-CLI-000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
