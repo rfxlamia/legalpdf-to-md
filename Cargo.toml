@@ -1,0 +1,26 @@
+[package]
+name = "legalpdf-to-md"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "legalpdf_to_md"
+path = "src/lib.rs"
+
+[[bin]]
+name = "legalpdf2md"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+which = "6"
+globwalk = "0.9"
+thiserror = "1"
+once_cell = "1"
+tempfile = "3"
+regex = "1"
+sha2 = "0.10"
+
+[dev-dependencies]

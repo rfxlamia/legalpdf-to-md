@@ -1,0 +1,333 @@
+# Patch-Refinement — legalpdf-to-md (Choice B)
+
+> Tujuan patch: menurunkan **leak\_rate → 0.00**, menghapus **split\_violations**, membuat **idempotensi meta** stabil via **normalisasi di acceptance** (Pilihan **B**), serta menambah **page\_count** & **timing** ke meta.
+
+---
+
+## 0) Ringkasan Keputusan
+
+* **Idempotensi meta**: **B** — normalisasi di acceptance (hapus field volatil saat hashing/perbandingan). Tambah `meta_fingerprint` (hash dari meta yang sudah dinormalisasi) agar bisa diverifikasi tanpa jq.
+* **Leak cleanup**: perluas regex nomor halaman, tambah detektor baris berulang lintas-halaman (repeated-line suppressor) dengan whitelist legal.
+* **Split violations**: gabungkan enumerator yatim (`(1)`, `1.`, `a.`) dengan baris berikutnya sebelum normalisasi list.
+* **Meta**: tambahkan `page_count`, `timing_ms_per_page[]`, `p95_latency_ms_per_page`, dan `meta_fingerprint`.
+* **Acceptance**: gunakan **ground\_truth.yaml** untuk akurasi struktur; ambil page/latency dari meta; normalisasi meta sebelum hash; tambah tes NoStepLeak & PerDocLayout.
+
+---
+
+## 1) Cakupan Patch (Scope)
+
+**Masuk**: modul `post/law_cleanup.rs`, `post/normalize.rs`, `post/lists.rs`, `metrics.rs`, `emit.rs`, `cli/acceptance.sh` (atau runner), `tests/fixtures/ground_truth.yaml`, pembaruan kecil `prd.yaml`.
+
+**Tidak masuk**: parser tabel kompleks, multi-kolom advanced, PDFium pathway, OCR heuristik baru.
+
+---
+
+## 2) Perubahan di Binary
+
+### 2.1 law\_cleanup — Header/Footer & Nomor Halaman
+
+Urutan eksekusi dalam `law_cleanup(text, law_mode)`:
+
+1. **Hapus header/footer spesifik** (regex kuat).
+2. **Hapus nomor halaman** (variasi dash/“Hal.”/“Halaman”).
+3. **Repeated-line suppressor** lintas-halaman.
+4. Lanjut ke **unwrap hyphenation** dan **join soft-wrap**.
+
+#### 2.1.1 Regex nomor halaman (full-line only)
+
+> Semua pola **anchor** dengan `^…$` agar tidak menghapus konten di tengah paragraf.
+
+* Garis nomor dengan berbagai jenis dash:
+
+```
+(?m)^\s*[\u2012\u2013\u2014\u2212\-]{1,3}\s*\d+\s*[\u2012\u2013\u2014\u2212\-]{1,3}\s*$
+```
+
+* Penanda halaman eksplisit (case-insensitive):
+
+```
+(?mi)^\s*(Hal(?:\.|aman))\s*\d+\s*$
+```
+
+* Angka polos **yang berulang antar banyak halaman** (lihat suppressor di bawah); regex:
+
+```
+(?m)^\s*\d{1,4}\s*$
+```
+
+> **Mitigasi FP**: angka polos **tidak** langsung dihapus oleh regex; hanya dihapus jika lewat ambang frekuensi suppressor (≥60% halaman). Ini mencegah terhapusnya angka penting di isi (mis. “1970”).
+
+#### 2.1.2 Header/footer spesifik umum
+
+Tambahkan pola-pola berikut (case-insensitive):
+
+```
+(?mi)^\s*PRESIDEN\s+REPUBLIK\s+INDONESIA\s*$
+(?mi)^\s*KEMENTERIAN\s+KETENAGAKERJAAN\s*(RI)?\s*$
+(?mi)^\s*LEMBARAN\s+NEGARA\s+REPUBLIK\s+INDONESIA\s*.*$
+```
+
+> **Mitigasi FP**: Hanya hapus jika **full-line** dan **pendek** (`len<=120`) atau termasuk daftar frasa header standar. Jangan hapus bila mengandung kata kunci legal section (`BAB`, `Pasal`, `Menimbang`, `Mengingat`, `PENJELASAN`).
+
+#### 2.1.3 Repeated-line suppressor (lintas-halaman)
+
+Algoritma (per dokumen, sebelum join-wrap):
+
+* Split per halaman (kita sudah punya `pages[]` dari ekstraksi).
+* Normalisasi baris: trim, collapse whitespace, hilangkan nomor halaman via regex di atas **sementara** untuk deteksi.
+* Hitung frekuensi baris (hash map `line->count_pages`), **abaikan** baris kosong.
+* **Ambang**: `repeat_threshold = ceil(0.60 * page_count)` (konfigurable via `--suppressor-threshold`), `min_len=3`, `max_len=120`.
+* **Whitelist** (jangan hapus):
+
+  * `^(BAB\s+[IVXLCDM])`
+  * `^Pasal\s+\d+`
+  * \`^(Menimbang|Mengingat)\s\*:?
+  * `^PENJELASAN\s*$`
+* **Blacklist ringan** (prioritas dihapus): frasa instansi (PRESIDEN, KEMENTERIAN…), “LEMBARAN NEGARA…”, nama kementerian/instansi umum.
+* Tandai kandidat yang memenuhi ambang; hapus hanya **jika juga berada di posisi awal/akhir halaman** pada ≥50% halaman (heuristik lokasi), untuk menghindari penghapusan judul asli di dalam isi.
+* Simpan **contoh baris yang dihapus** (maks 5 contoh) ke `meta.stats.removed_lines_sample`.
+
+**Mitigasi kesalahan**:
+
+* **Guard**: batasi **maksimum 5 baris** dihapus per halaman oleh suppressor. Jika terlampaui, matikan suppressor untuk halaman itu dan log `suppressor_overrun`.
+* **Rescue flag**: `--keep-lines <regex>` untuk mengecualikan pola tertentu dari penghapusan (berguna saat ada FP spesifik). Simpan `meta.stats.keep_lines_regex`.
+* **Dry-run**: jika `--artifacts=on`, tulis `artifacts/suppressor_preview.txt` berisi daftar kandidat yang dihapus dengan skor/halaman-asal untuk audit cepat.
+
+---
+
+### 2.2 Join & Normalisasi Teks
+
+#### 2.2.1 Unwrap hyphenation
+
+```
+(\w)-\n(\w)  ->  $1$2
+```
+
+#### 2.2.2 Join soft-wrap (heuristik aman)
+
+* Jika baris A berakhir **alnum** dan baris B diawali **lowercase/alnum/punctuation ringan** → gabung dengan spasi.
+* Jangan menggabung jika baris A berakhir `:`, `;`, atau merupakan heading (regex heading sudah terdeteksi).
+
+#### 2.2.3 Gabung **enumerator yatim** (sebelum normalisasi list)
+
+Pola baris yatim:
+
+```
+(?m)^\s*\((\d+)\)\s*$
+(?m)^\s*([0-9]+)\.\s*$
+(?m)^\s*([a-z])\.\s*$
+```
+
+Aksi: gabung dengan baris berikutnya, sisipkan spasi: `"(1) " + nextline`.
+
+> **Mitigasi**: jangan gabung jika baris berikutnya kosong atau heading.
+
+#### 2.2.4 Normalisasi list
+
+* `^\s*[a-z]\.\s+` → `- ($1) ` (bullet beranotasi),
+* `^\s*[0-9]+\.\s+` → `1. ` (ordered list Markdown).
+
+> **Guard**: jika setelah normalisasi ditemukan baris `- (a)` **tanpa isi**, tandai sebagai **split\_violation** dan coba merge dengan baris berikutnya; jika gagal, naikkan counter untuk metrik.
+
+---
+
+### 2.3 Metrics & Meta Enrichment
+
+Tambahkan di `meta.json` (per dokumen):
+
+```json
+{
+  "page_count": <int>,
+  "timing_ms_per_page": [12, 17, 9, ...],
+  "p95_latency_ms_per_page": <int>,
+  "stats": {
+    "removed_header": <int>,
+    "removed_footer": <int>,
+    "removed_lines_sample": ["PRESIDEN REPUBLIK INDONESIA", "— 12 —", "LEMBARAN NEGARA …"]
+  },
+  "metrics": {
+    "character_coverage": <float>,
+    "leak_rate": <float>,
+    "split_violations": <int>
+  },
+  "meta_fingerprint": "<sha256 of normalized meta>"
+}
+```
+
+**Definisi p95**: hitung dari `timing_ms_per_page`, simpan sebagai integer.
+
+**Normalized meta untuk fingerprint**:
+
+* Clone meta → hapus bidang volatil: `timestamps`, `metrics.duration_ms?`, `stats.runtime_ms?` → serialisasi → SHA-256 hex lower.
+* Simpan hasil ke `meta_fingerprint`.
+
+---
+
+## 3) Acceptance Runner (Choice B)
+
+### 3.1 Normalisasi meta saat idempotensi
+
+* Bandingkan hash **MD** apa adanya.
+* Bandingkan **meta\_fingerprint** antar-run; jika field ini sama, lulus idempotensi meta.
+* Alternatif (fallback): gunakan `jq 'del(.timestamps, .metrics.duration_ms?, .stats.runtime_ms?)'` lalu hash.
+
+### 3.2 Ground Truth Struktur
+
+Buat `tests/fixtures/ground_truth.yaml`:
+
+```
+uu-212000: { pasal: 48, bab: 16 }
+uu022024:  { pasal: 116, bab: 10 }
+pp352021:  { pasal: 15,  bab: 11 }
+# tambahkan lainnya saat sudah diaudit
+```
+
+* Hitung dari MD: `count(/^##\s+Pasal\s+\d+/m)`, `count(/^##\s+BAB\s+[IVXLCDM]+/m)`.
+* `accuracy = 1 - |found - expected| / expected` (pasal & bab). **Assert ≥ 0.98**.
+* Jika doc\_id tidak ada di fixtures → tandai `SKIP(structure)` dengan peringatan.
+
+### 3.3 KPI & Checks yang diupdate
+
+* **Coverage ≥ 0.99** (pakai `meta.metrics.character_coverage`).
+* **Leak == 0** (pakai `meta.metrics.leak_rate`).
+* **Split == 0** (pakai `meta.metrics.split_violations`).
+* **Latency p95 ≤ 400 ms/hal** (pakai `meta.p95_latency_ms_per_page`).
+* **NoStepLeak**: `find output -maxdepth 1 -name '*.step*_*.txt'` kosong.
+* **PerDocLayout**: untuk tiap `output/<doc_id>/` wajib ada `<doc_id>.md` & `.meta.json` dan tiada `.tmp`.
+* **Artifacts toggle**: konten MD sama; `meta_fingerprint` sama antar on/off.
+
+---
+
+## 4) PRD (Machine Layer) — Patch
+
+* `outputs.files` tak berubah; tambahkan skema meta di **tools.emit\_files** deskriptif (`page_count`, `timing_ms_per_page`, `meta_fingerprint`).
+* `acceptance_tests` diperluas: tambahkan Acc **NoStepLeak**, **PerDocLayout**, gunakan ground\_truth untuk Acc-1.
+
+---
+
+## 5) Implementasi Teknis (Sketch)
+
+### 5.1 Repeated-line suppressor (pseudocode Rust)
+
+```rust
+fn suppress_repeated_lines(pages: &[String], cfg: &Cfg) -> (String, SuppressReport) {
+    use std::collections::HashMap;
+    let n = pages.len();
+    let mut freq: HashMap<String, usize> = HashMap::new();
+    let mut per_page_lines: Vec<Vec<String>> = Vec::with_capacity(n);
+
+    for p in pages {
+        let lines: Vec<String> = p.lines()
+            .map(|l| norm_line(l)) // trim, collapse spaces
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut uniq = std::collections::HashSet::new();
+        for l in &lines { if uniq.insert(l.clone()) { *freq.entry(l.clone()).or_default() += 1; } }
+        per_page_lines.push(lines);
+    }
+
+    let thr = (cfg.repeat_ratio * n as f32).ceil() as usize; // default 0.60
+    let mut candidates: std::collections::HashSet<String> = freq.into_iter()
+        .filter(|(l,c)| l.len()>=cfg.min_len && l.len()<=cfg.max_len && *c>=thr)
+        .map(|(l,_)| l).collect();
+
+    // whitelist: keep legal headings
+    candidates.retain(|l| !LEGAL_WHITELIST.is_match(l));
+
+    // lokasi awal/akhir halaman: hanya hapus jika muncul di posisi tsb >=50% halaman
+    let mut pos_ok: std::collections::HashSet<String> = Default::default();
+    for (i, lines) in per_page_lines.iter().enumerate() {
+        let start = lines.get(0).cloned().unwrap_or_default();
+        let end   = lines.last().cloned().unwrap_or_default();
+        if candidates.contains(&start) { *POS.entry(start).or_default() += 1; }
+        if candidates.contains(&end)   { *POS.entry(end).or_default()   += 1; }
+    }
+    for (l,c) in POS { if c * 2 >= n { pos_ok.insert(l); } }
+
+    let mut removed_samples = vec![];
+    let mut out_pages = Vec::with_capacity(n);
+    for lines in per_page_lines {
+        let mut removed = 0usize;
+        let mut kept = Vec::new();
+        for l in lines {
+            let kill = pos_ok.contains(&l) && removed < cfg.max_removed_per_page;
+            if kill { if removed_samples.len()<5 { removed_samples.push(l.clone()); } removed+=1; }
+            else { kept.push(l); }
+        }
+        out_pages.push(kept.join("\n"));
+    }
+    (out_pages.join("\n\n"), SuppressReport { removed_lines_sample: removed_samples })
+}
+```
+
+> `LEGAL_WHITELIST` meliputi `^(BAB\s+[IVXLCDM])|^Pasal\s+\d+|^(Menimbang|Mengingat)\b|^PENJELASAN\b` (case-insensitive). Parameter default: `repeat_ratio=0.60`, `max_removed_per_page=5`, `min_len=3`, `max_len=120`.
+
+### 5.2 Meta fingerprint (Rust sketch)
+
+```rust
+fn meta_fingerprint(meta: &serde_json::Value) -> anyhow::Result<String> {
+    let mut norm = meta.clone();
+    if let Some(obj) = norm.as_object_mut() {
+        obj.remove("timestamps");
+        if let Some(metrics) = obj.get_mut("metrics").and_then(|m| m.as_object_mut()) {
+            metrics.remove("duration_ms");
+        }
+        if let Some(stats) = obj.get_mut("stats").and_then(|m| m.as_object_mut()) {
+            stats.remove("runtime_ms");
+        }
+    }
+    let bytes = serde_json::to_vec(&norm)?;
+    Ok(format!("{:x}", sha2::Sha256::digest(&bytes)))
+}
+```
+
+---
+
+## 6) Risiko & Mitigasi
+
+* **Teks sah ikut terhapus (over-filter)**:
+
+  * Semua penghapusan berbasis **full-line** dan **ambang frekuensi** (≥60% halaman) + **lokasi halaman** (awal/akhir) + **whitelist legal headings**.
+  * Batas **maks 5 baris/halaman** oleh suppressor.
+  * **Rescue** via `--keep-lines` dan **artefak** `suppressor_preview.txt` untuk audit manual.
+* **Enumerator digabung salah**: hindari join jika baris berikutnya adalah heading atau kosong; cek ulang setelah normalisasi list.
+* **Meta idempotensi**: gunakan `meta_fingerprint` sehingga CI konsisten tanpa mengorbankan observability.
+
+---
+
+## 7) Pembaruan Acceptance & CI
+
+* Runner:
+
+  * Gunakan `meta.page_count`, `meta.p95_latency_ms_per_page`.
+  * Hitung struktur dari MD + cocokkan dengan `tests/fixtures/ground_truth.yaml` (toleransi default 2%).
+  * Bandingkan `meta_fingerprint` antar run (artifacts on/off) untuk idempotensi meta.
+* CI: install `jq`; tambahkan tes **NoStepLeak** & **PerDocLayout**.
+
+---
+
+## 8) Checklist Eksekusi
+
+1. Implement regex & suppressor + join enumerator.
+2. Tambah `page_count`, `timing_ms_per_page`, `p95_latency_ms_per_page` ke meta.
+3. Tambah `meta_fingerprint`.
+4. Update acceptance runner (normalisasi meta via fingerprint, p95 dari meta, ground\_truth).
+5. Tambah `tests/fixtures/ground_truth.yaml` (seed dari hasil MD yang kamu anggap benar).
+6. Jalankan batch; pastikan `leak=0`, `split=0`, **coverage≥0.99**.
+7. Bekukan ground\_truth; commit.
+
+---
+
+## 9) Catatan untuk README (nanti)
+
+* Jelaskan flags baru (`--keep-lines`, `--suppressor-threshold`).
+* Struktur output per-doc + `meta.json` schema (bidang baru).
+* Cara menjalankan acceptance & makna `meta_fingerprint`.
+
+---
+
+## 10) Pertanyaan Terbuka
+
+* Ambang suppressor default 60% terlalu ketat/longgar? (bisa 50–70%).
+* Perlu `--dangerously-loose` untuk dokumen sangat kotor? (non-default).
+* Perlu daftar stopwords instansi yang lebih panjang untuk blacklist?

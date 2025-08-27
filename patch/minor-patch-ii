@@ -1,0 +1,232 @@
+# Minor-Patch-II — acceptance meta & pp362021 triage
+
+Tujuan patch:
+
+* Menstabilkan **idempotensi meta** sesuai refinement-patch (normalisasi di acceptance) dengan memakai `meta_fingerprint`.
+* Memperbaiki kontrol alur **OCR** dan skema **meta.json** agar kasus seperti **pp362021** tidak lolos atau salah diagnosa.
+* Menambahkan orakel tes (FAIL tegas) ketika halaman “suspect” **tidak** di-OCR.
+
+---
+
+## 0) Ringkasan Perubahan
+
+1. **Acceptance runner**: bandingkan **`meta_fingerprint`** untuk idempotensi; ambil **`page_count`** & **`p95_latency_ms_per_page`** dari meta; tambah rule **OCRSkippedOnSuspects** serta metrik **coverage\_pages**.
+2. **Binary/meta schema**: tegaskan bidang `ocr` dan `suspect_pages`; tambahkan `ocr_run_pages`, `meta_fingerprint`, `page_count`, `timing_ms_per_page`, `p95_latency_ms_per_page`.
+3. **Kontrol alur OCR**: bila `suspect_pages` ≠ ∅ dan OCR **tidak** dinonaktifkan serta Tesseract tersedia → **wajib jalan**. Bila tidak jalan, tulis `ocr.skipped_reason` eksplisit.
+4. **pp362021**: jalankan ulang dengan OCR aktif; pastikan `found.pasal>0`, `found.bab>0`, `leak_rate=0`, `coverage_pages=1.0`.
+
+---
+
+## 1) Acceptance Runner — Patch
+
+### 1.1 Idempotensi meta via `meta_fingerprint`
+
+Ganti pembanding meta mentah menjadi fingerprint:
+
+```bash
+# setelah dua run (artifacts=on dan artifacts=off) tersedia
+META1="output/$DOC/$DOC.meta.json"
+META2="output_off/$DOC/$DOC.meta.json"   # atau path run kedua mana pun
+
+F1=$(jq -r '.meta_fingerprint // empty' "$META1")
+F2=$(jq -r '.meta_fingerprint // empty' "$META2")
+
+if [ -n "$F1" ] && [ -n "$F2" ]; then
+  [ "$F1" = "$F2" ] || { echo "FAIL: meta_fingerprint differs for $DOC"; exit 1; }
+else
+  # fallback normalisasi bila fingerprint belum tersedia
+  H1=$(jq 'del(.timestamps, .metrics.duration_ms?, .stats.runtime_ms?)' "$META1" | sha256sum | cut -d' ' -f1)
+  H2=$(jq 'del(.timestamps, .metrics.duration_ms?, .stats.runtime_ms?)' "$META2" | sha256sum | cut -d' ' -f1)
+  [ "$H1" = "$H2" ] || { echo "FAIL: normalized meta hash differs for $DOC"; exit 1; }
+fi
+```
+
+### 1.2 Sumber data halaman & latency
+
+Ambil dari meta, bukan log:
+
+```bash
+PAGES=$(jq -r '.page_count' "$META1")
+P95=$(jq -r '.p95_latency_ms_per_page' "$META1")
+```
+
+### 1.3 Aturan baru: OCRSkippedOnSuspects + coverage\_pages
+
+Tambahkan validasi berikut di acceptance:
+
+```bash
+SUSPECTS=$(jq -r '.suspect_pages | length' "$META1")
+OCR_RAN=$(jq -r '.ocr.ran' "$META1")
+RUN_PAGES=$(jq -r '.ocr.ocr_run_pages | length // 0' "$META1")
+
+# coverage_pages = 1 - (suspects_not_ocr / page_count)
+COVP=$(jq -r --argjson pg "$PAGES" --argjson sp "$SUSPECTS" --argjson rp "$RUN_PAGES" 'if $pg>0 then 1 - ((($sp - $rp)|max(0)) / $pg) else 0 end' <<< '{}')
+
+if [ "$SUSPECTS" -gt 0 ] && [ "$OCR_RAN" != "true" ]; then
+  echo "FAIL: OCRSkippedOnSuspects ($DOC)"; exit 1
+fi
+
+# KPI: coverage_pages harus 1.0 jika OCR berjalan
+if [ "$SUSPECTS" -gt 0 ] && [ "$COVP" != "1" ] && [ "$COVP" != "1.0" ]; then
+  echo "FAIL: coverage_pages<1.0 ($DOC => $COVP)"; exit 1
+fi
+```
+
+### 1.4 Tabel ringkas
+
+Tambahkan kolom: `suspect_pages`, `ocr_run_pages`, `coverage_pages`, `p95_ms_per_page` (dari meta), serta status idempotensi meta.
+
+---
+
+## 2) Binary — Schema & Kontrol Alur
+
+### 2.1 Skema `meta.json` (revisi)
+
+Tambahkan/tegaskan bidang-bidang ini:
+
+```json
+{
+  "doc_id": "pp362021",
+  "page_count": 75,
+  "timing_ms_per_page": [12, 15, ...],
+  "p95_latency_ms_per_page": 120,
+  "suspect_pages": [1,2,3,...],
+  "ocr": {
+    "enabled": true,
+    "ran": true,
+    "skipped_reason": null,
+    "ocr_run_pages": [1,2,3,...]
+  },
+  "found": {"pasal": 15, "bab": 11, "menimbang": true, "mengingat": true, "penjelasan": true},
+  "stats": {
+    "removed_header": 42,
+    "removed_footer": 42,
+    "removed_lines_sample": ["— 12 —", "LEMBARAN NEGARA ..."]
+  },
+  "metrics": {
+    "character_coverage": 0.995,
+    "leak_rate": 0.0,
+    "split_violations": 0
+  },
+  "meta_fingerprint": "<sha256(meta_normalized)>",
+  "timestamps": {"started": "...", "finished": "..."}
+}
+```
+
+> `meta_fingerprint` dihitung dari meta **setelah** menghapus field volatil (`timestamps`, durasi runtime opsional) agar acceptance stabil.
+
+### 2.2 Kontrol Alur OCR (wajib)
+
+* **Pra-syarat**: `tesseract` tersedia → `ocr.enabled=true`.
+* **Aturan**: jika `suspect_pages` ≠ ∅ **dan** `ocr.enabled=true` → **jalankan OCR** pada indeks tersebut.
+* **Jika tidak dijalankan**, isi: `ocr.ran=false` dan `ocr.skipped_reason` ∈ {`disabled_by_flag`, `tesseract_missing`, `internal_error`}.
+* **Catat** halaman yang benar-benar di-OCR di `ocr.ocr_run_pages`.
+
+> Perubahan nama: bila sebelumnya ada `ocr_pages` yang ambigu, ganti menjadi `suspect_pages` (deteksi) dan `ocr.ocr_run_pages` (eksekusi faktual).
+
+### 2.3 Normalisasi untuk deteksi heading (NON-destruktif)
+
+* Hanya untuk **deteksi** (pengisian `found.*`), bukan modifikasi isi MD:
+
+  * Collapse whitespace ganda, konversi NBSP → spasi biasa.
+  * Regex toleran spasi: `(?mi)^\s*Menimbang\s*:` , `^\s*Mengingat\s*:` , `^\s*BAB\s+[IVXLCDM]+\b` , `^\s*Pasal\s+\d+\b`.
+
+---
+
+## 3) Investigasi & Tindakan untuk **pp362021**
+
+### 3.1 Temuan
+
+* `suspect_pages` padat, OCR **tidak** berjalan → isi hilang → `found.pasal=0`, `found.bab=0`, `leak_rate=1.0`.
+* `character_coverage` menipu karena dihitung terhadap hasil ekstraksi awal yang minim.
+
+### 3.2 Langkah eksekusi ulang (setelah patch)
+
+```bash
+DOC=pp362021
+legalpdf2md --per-doc-dir=on --artifacts=on --dump-steps --law-mode=auto ./input/pp/${DOC}.pdf
+jq . output/${DOC}/${DOC}.meta.json | bat -l json
+```
+
+**Ekspektasi PASS:**
+
+* `ocr.enabled=true`, `ocr.ran=true`, `ocr.ocr_run_pages.length == suspect_pages.length`
+* `found.pasal > 0`, `found.bab > 0`
+* `metrics.leak_rate == 0`, `metrics.split_violations == 0`
+* `coverage_pages == 1.0`
+
+---
+
+## 4) Acceptance — Fail Codes baru (disarankan)
+
+* `OCRSkippedOnSuspects`: `suspect_pages>0` dan `ocr.ran=false`.
+* `CoveragePagesLow`: `coverage_pages<1.0` ketika `suspect_pages>0`.
+* `MetaIdempotency`: fingerprint beda antar run.
+
+Tampilkan dalam kolom `status_reason` agar mudah triage.
+
+---
+
+## 5) Patch PRD (Machine Layer) — delta singkat
+
+Tambahkan/ubah pada `prd.yaml` (sketsa):
+
+```yaml
+tools:
+  - name: "ocr_tesseract"
+    schema:
+      input: { path: string, pages: array<int>, lang: string, dpi: int }
+      output: { texts: array<{index:int,text:string}> }
+    errors: ["OcrFailed"]
+  - name: "emit_files"
+    schema:
+      input:
+        { markdown: string,
+          meta: {
+            doc_id: string,
+            page_count: int,
+            timing_ms_per_page: array<int>,
+            p95_latency_ms_per_page: int,
+            suspect_pages: array<int>,
+            ocr: { enabled: bool, ran: bool, skipped_reason: string|null, ocr_run_pages: array<int> },
+            found: object,
+            stats: object,
+            metrics: object,
+            meta_fingerprint: string
+          },
+          outdir: string,
+          doc_id: string }
+
+acceptance_tests:
+  - name: "Acc-IdempotencyMeta"
+    assert: "meta_fingerprint run1 == meta_fingerprint run2"
+  - name: "Acc-OCR-Suspects"
+    assert: "suspect_pages>0 -> ocr.ran==true AND coverage_pages==1.0"
+```
+
+---
+
+## 6) Urutan Implementasi (untuk Codex CLI)
+
+1. **Acceptance**: ubah pembanding meta → `meta_fingerprint`; ambil `page_count` & `p95` dari meta; tambahkan aturan `OCRSkippedOnSuspects` dan hitung `coverage_pages`.
+2. **Binary**:
+
+   * Skema meta: tambahkan bidang `ocr`, `suspect_pages`, `ocr_run_pages`, `page_count`, `timing_ms_per_page`, `p95_latency_ms_per_page`, `meta_fingerprint`.
+   * Kontrol alur OCR: pastikan OCR **jalan** saat `suspect_pages` ≠ ∅ (kecuali dinonaktifkan/`tesseract` hilang). Isi `skipped_reason` bila tidak jalan.
+   * Normalisasi deteksi heading (non-destruktif) untuk `found.*`.
+3. **Re-run khusus** `pp362021` dengan `--artifacts=on --dump-steps` → verifikasi metrik.
+4. **Re-run batch** lengkap; pastikan tidak ada FAIL baru.
+
+---
+
+## 7) Risiko & Mitigasi
+
+* **False PASS karena meta\_fingerprint tidak dihitung** → acceptance punya fallback normalisasi jq; jika dua-duanya hilang, FAIL eksplisit.
+* **OCR force-run memperlambat** → hanya terjadi ketika `suspect_pages` ≠ ∅; metrik p95 terukur; ini memang kondisi wajib.
+* **Salah tulis bidang meta** → tambahkan validasi skema sederhana di acceptance (jq `has()` untuk bidang kunci) sebelum evaluasi KPI.
+
+---
+
+## 8) Catatan
+
+README akan diperbarui setelah patch ini stabil: menjelaskan kolom baru di meta, arti `meta_fingerprint`, dan kebijakan FAIL baru di acceptance.

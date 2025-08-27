@@ -1,0 +1,7 @@
+# Ground truth frozen from current outputs
+# doc_id: { bab: <int>, pasal: <int> }
+14pm017: { bab: 11, pasal: 21 }
+kemnaker-no-1-tahun-2017: { bab: 4, pasal: 0 }
+kemnaker-no-6-tahun-2016: { bab: 0, pasal: 0 }
+pp352021: { bab: 11, pasal: 15 }
+pp362021: { bab: 19, pasal: 164 }

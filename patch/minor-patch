@@ -1,0 +1,41 @@
+Patch minimal
+1) Tambah flag & konvensi
+* Default tanpa artefak debug di root.
+* Flag baru:
+** --artifacts=on|off (default: off)
+** --per-doc-dir=on|off (default: on)
+
+* Skema output saat --per-doc-dir=on:
+output/<doc_id>/
+├─ <doc_id>.md
+├─ <doc_id>.meta.json
+└─ artifacts/               # hanya jika --artifacts=on atau --dump-steps
+   ├─ step1_extract.txt
+   ├─ step2_merge.txt
+   └─ step3_md.txt
+
+2) Slug doc_id (deterministik & aman nama file)
+* Ambil dari basename sebelum .pdf, lalu slugify:
+** lowercase, non-alnum → -, trim -.
+** collision → tambahkan suffix -1, -2, …
+*Simpan doc_id di meta.json.
+
+3) Ubah T9 emit_files
+* Buat direktori output/<doc_id>/ dan output/<doc_id>/artifacts/ (jika perlu).
+* Tulis final ke:
+** output/<doc_id>/<doc_id>.md
+** output/<doc_id>/<doc_id>.meta.json
+
+* Jika --dump-steps/--artifacts=on, tulis step ke output/<doc_id>/artifacts/.
+* Atomic write: tulis ke file .tmp lalu rename → hindari file korup saat crash.
+
+4) Perbarui PRD yaml — patch singkat
+* outputs: ganti jadi:
+outputs:
+  dir: "./output/${doc_id}"
+  artifacts_dir: "./output/${doc_id}/artifacts"
+  files: ["${doc_id}.md", "${doc_id}.meta.json"]
+* T9 emit_files.input gunakan outdir: "${outputs.dir}" dan artifacts_dir: "${outputs.artifacts_dir}".
+
+5) Acceptance test tambahan
+“Acc-6_NoStepLeak: tidak ada file yang matching output/*.step*_*.txt”.

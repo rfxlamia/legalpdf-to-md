@@ -1,0 +1,259 @@
+# prd.yaml — legalpdf-to-md (Machine Layer)
+version: 1
+id: "proj-legalpdf-to-md"
+objective:
+  problem: "Regulasi dalam PDF sulit dipakai RAG/QA karena hilang struktur hukum dan banyak noise."
+  hypothesis: "Jika ekstraksi dilakukan via Poppler (default) + OCR fallback + law-aware post-processing, maka MD menjadi deterministik dan siap di-parse; presisi diukur oleh coverage≥99%, struktur≥98%, leak=0, dan latency p95≤400ms/halaman (tanpa OCR)."
+kpi:
+  - name: "structure_accuracy_pasals"
+    baseline: 0.90
+    target: 0.98
+  - name: "character_coverage"
+    baseline: 0.96
+    target: 0.99
+  - name: "leak_rate_header_footer"
+    baseline: 0.05
+    target: 0.00
+  - name: "latency_ms_p95_per_page_no_ocr"
+    baseline: 800
+    target: 400
+scope:
+  in:
+    - "Poppler pdftotext -layout (default engine)"
+    - "OCR Tesseract per halaman suspect (opsional, --with-ocr)"
+    - "Law-aware post-processing: header/footer cleanup, wrap join, hyphenation removal, list normalization, promotion Menimbang/Mengingat/BAB/Pasal/Penjelasan"
+    - "Emit out.md + out.meta.json"
+    - "CLI flags: --engine poppler|pdfium, --with-ocr, --ocr-lang, --law-mode, --dump-steps, --strict"
+  out:
+    - "Parser tabel kompleks dan multi-kolom lanjutan"
+    - "Output AST JSON (fase 2 opsional)"
+    - "Penyimpanan ke DB/embeddings"
+constraints:
+  budget_usd: 0
+  token_cap: 0
+  runtime_min_per_job: 0
+  compliance: ["PII:no", "Docs:public_regulation"]
+  os: ["Ubuntu 24.04 LTS"]
+  install:
+    - "sudo nala install poppler-utils tesseract-ocr tesseract-ocr-ind pkg-config clang"
+datasources:
+  - name: "bpk_pdfs"
+    type: "filesystem"
+    path: "./input/**/*.pdf"
+    access: "ro"
+outputs:
+  dir: "./output"
+  files: ["${doc_id}.md", "${doc_id}.meta.json"]
+tools:
+  - name: "check_deps"
+    schema:
+      input: {}
+      output: { ok: "bool", missing: "array<string>" }
+    preconditions: []
+    side_effects: []
+    errors: ["MissingDependency"]
+  - name: "enumerate_pdfs"
+    schema:
+      input: { glob: "string" }
+      output: { files: "array<string>" }
+    preconditions: ["path_glob(glob)"]
+    side_effects: []
+    errors: ["NoFilesFound"]
+  - name: "poppler_extract"
+    schema:
+      input: { path: "string", layout: "bool", nopgbrk: "bool" }
+      output: { pages: "array<string>" } # text per halaman
+    preconditions: ["file_exists(path)"]
+    side_effects: []
+    errors: ["FileNotFound", "EncryptedPDF"]
+  - name: "detect_suspect_pages"
+    schema:
+      input: { pages: "array<string>", min_chars: "int" }
+      output: { suspect_indices: "array<int>" }
+    preconditions: []
+    side_effects: []
+    errors: []
+  - name: "ocr_tesseract"
+    schema:
+      input: { path: "string", pages: "array<int>", lang: "string", dpi: "int" }
+      output: { texts: "array<{index:int,text:string}>" }
+    preconditions: ["file_exists(path)"]
+    side_effects: ["temp_images_created"]
+    errors: ["OcrFailed"]
+  - name: "merge_pages"
+    schema:
+      input:
+        {
+          pages: "array<string>",
+          ocr_overrides: "array<{index:int,text:string}>",
+        }
+      output: { text: "string" }
+    preconditions: []
+    side_effects: []
+    errors: []
+  - name: "law_cleanup"
+    schema:
+      input: { text: "string", law_mode: "string" } # auto|uu|pp|permen|perwali
+      output: { cleaned: "string", stats: "object" } # {removed_header:int, removed_footer:int, hyphens_fixed:int}
+    preconditions: []
+    side_effects: []
+    errors: []
+  - name: "promote_legal_headings"
+    schema:
+      input: { text: "string", law_mode: "string" }
+      output: { markdown: "string", found: "object" } # found: {pasal:int, bab:int, menimbang:bool, mengingat:bool, penjelasan:bool}
+    preconditions: []
+    side_effects: []
+    errors: ["StructureNotFound"]
+  - name: "compute_metrics"
+    schema:
+      input: { raw_text: "string", markdown: "string", found: "object" }
+      output:
+        {
+          character_coverage: "float",
+          leak_rate: "float",
+          split_violations: "int",
+        }
+    preconditions: []
+    side_effects: []
+    errors: []
+  - name: "emit_files"
+    schema:
+      input:
+        {
+          markdown: "string",
+          meta: "object",
+          outdir: "string",
+          doc_id: "string",
+        }
+      output: { md_path: "string", meta_path: "string" }
+    preconditions: ["dir_exists(outdir)"]
+    side_effects: ["file_write"]
+    errors: ["WriteFailed"]
+task_graph:
+  - id: "T0"
+    uses: "check_deps"
+    input: {}
+    next: ["T1"]
+  - id: "T1"
+    uses: "enumerate_pdfs"
+    input: { glob: "${datasources.bpk_pdfs.path}" }
+    next: ["T2"]
+  - id: "T2"
+    foreach: "${T1.output.files}"
+    uses: "poppler_extract"
+    input: { path: "${item}", layout: true, nopgbrk: true }
+    next: ["T3"]
+  - id: "T3"
+    uses: "detect_suspect_pages"
+    input: { pages: "${T2.output.pages}", min_chars: 64 }
+    next: ["T4"]
+  - id: "T4"
+    condition: "${len(T3.output.suspect_indices) > 0}"
+    uses: "ocr_tesseract"
+    input:
+      {
+        path: "${item}",
+        pages: "${T3.output.suspect_indices}",
+        lang: "ind",
+        dpi: 300,
+      }
+    next: ["T5"]
+  - id: "T5"
+    uses: "merge_pages"
+    input: { pages: "${T2.output.pages}", ocr_overrides: "${T4.output.texts}" }
+    next: ["T6"]
+  - id: "T6"
+    uses: "law_cleanup"
+    input: { text: "${T5.output.text}", law_mode: "auto" }
+    next: ["T7"]
+  - id: "T7"
+    uses: "promote_legal_headings"
+    input: { text: "${T6.output.cleaned}", law_mode: "auto" }
+    next: ["T8"]
+  - id: "T8"
+    uses: "compute_metrics"
+    input:
+      {
+        raw_text: "${T5.output.text}",
+        markdown: "${T7.output.markdown}",
+        found: "${T7.output.found}",
+      }
+    next: ["T9"]
+  - id: "T9"
+    uses: "emit_files"
+    input:
+      {
+        markdown: "${T7.output.markdown}",
+        meta:
+          {
+            doc_id: "${basename(item)}",
+            found: "${T7.output.found}",
+            stats: "${T6.output.stats}",
+            metrics: "${T8.output}",
+            engine: "poppler",
+            ocr_pages: "${T3.output.suspect_indices}",
+          },
+        outdir: "${outputs.dir}",
+        doc_id: "${basename(item)}",
+      }
+    next: []
+acceptance_tests:
+  - name: "Acc-1_Structure"
+    assert: "accuracy(pasal_detected) >= 0.98 AND accuracy(bab_detected) >= 0.98"
+  - name: "Acc-2_Coverage"
+    assert: "character_coverage >= 0.99"
+  - name: "Acc-3_LeakZero"
+    assert: "leak_rate == 0"
+  - name: "Acc-4_Latency"
+    assert: "p95_latency_no_ocr_ms_per_page <= 400"
+  - name: "Acc-5_Idempotency"
+    assert: "hash(md_run1) == hash(md_run2)"
+observability:
+  logs:
+    [
+      "task_id",
+      "file",
+      "tool",
+      "duration_ms",
+      "error_code",
+      "pages",
+      "ocr_pages",
+      "found_pasal",
+      "found_bab",
+      "coverage",
+      "leak_rate",
+      "split_violations",
+    ]
+  traces: true
+  sample_rate: 1.0
+error_handling:
+  retries: { max: 2, backoff: "exponential" }
+  fallbacks:
+    - on: "MissingDependency"
+      do: "fail_fast_with_help" # print nala install command
+    - on: "EncryptedPDF"
+      do: "skip_and_log"
+    - on: "OcrFailed"
+      do: "continue_without_ocr_for_that_page"
+    - on: "StructureNotFound"
+      do: "flag_in_meta_and_continue_unless_strict"
+rollback:
+  strategy: "per_file_atomic"
+  detector: "error_rate > 5% within batch"
+  action: "delete outputs for affected files"
+security:
+  secrets: []
+  network: ["none"]
+versioning:
+  prd_hash: "<commit_sha>"
+  binary_name: "legalpdf2md"
+  cli_flags:
+    [
+      "--engine",
+      "--with-ocr",
+      "--ocr-lang",
+      "--law-mode",
+      "--dump-steps",
+      "--strict",
+    ]

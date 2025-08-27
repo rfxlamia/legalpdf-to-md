@@ -1,0 +1,207 @@
+# Minor-Patch-III — OCR deterministik & robust untuk PDF image-scan
+
+## Tujuan
+
+Memastikan semua PDF image-scan (campuran atau murni gambar) terekstrak utuh melalui OCR dengan alur deterministik, metrik jelas, dan artefak audit yang memadai. Patch ini menyelesaikan kegagalan pada PP36/2021 dan mengeras­kan pipeline untuk kasus serupa.
+
+---
+
+## Ringkasan akar masalah (yang diperbaiki)
+
+1. **PDF image-heavy** → hasil `pdftotext` minim → halaman ditandai `suspect`.
+2. **OCR tidak benar-benar berjalan** karena bug penamaan output `pdftoppm`/mismatch indeks halaman → tidak ada `ocr_run_pages` yang sukses.
+3. **Acceptance** belum gagal dini saat `suspect_pages>0` namun OCR tidak menghasilkan teks.
+
+Patch ini mengatasi ketiganya dengan **render-then-OCR per-halaman** yang deterministik, validasi artefak, serta aturan acceptance yang tegas.
+
+---
+
+## Scope
+
+**Masuk**: modul OCR (render & ocr per halaman), merge overrides, meta schema, artefak OCR, acceptance runner, prd.yaml delta kecil, flags CLI OCR.
+
+**Tidak masuk**: PDFium pathway, parser tabel/kolom lanjutan, tuning heuristik layout multi-kolom.
+
+---
+
+## Perubahan pada Binary
+
+### 1) Render per halaman — nama file deterministik
+
+* Gunakan **per halaman** (bukan rentang) agar penamaan konsisten.
+* Perintah (sketsa):
+
+  ```bash
+  pdftoppm -f {p} -l {p} -r {dpi} -png -singlefile "{INPUT}.pdf" "{ARTIFACTS}/ocr/page-{p}"
+  ```
+
+  → Hasil pasti: `artifacts/ocr/page-{p}.png` (indeks **1-based**), tanpa suffix `-1`.
+* **Guard**: cek eksistensi & ukuran file > 0 sebelum OCR.
+
+### 2) OCR per halaman — hanya jika gambar ada
+
+* Perintah:
+
+  ```bash
+  tesseract "artifacts/ocr/page-{p}.png" stdout -l {lang} --psm {psm} --oem {oem}
+  ```
+* Default: `{lang}=ind`, `{psm}=4` (dokumen teks tunggal variatif), `{oem}=1` (LSTM). Flags bisa dioverride via CLI.
+* **Fallback adaptif per halaman** (opsional, aman):
+
+  * Jika kosong/galat, coba ulang **sekali** dengan `{lang}=ind+eng` atau `{psm}=6`.
+  * Catat percobaan & alasan di meta (lihat skema di bawah).
+
+### 3) Konsistensi indeks halaman
+
+* `suspect_pages` disimpan **1-based**.
+* Render & OCR memakai indeks **yang sama**.
+* `ocr_run_pages` menyimpan halaman yang benar-benar menghasilkan teks.
+
+### 4) Urutan pipeline
+
+`extract → detect_suspects → render+ocr per halaman → merge_overrides → cleanup (header/footer, hyphenation, join) → promote headings → metrics → emit`.
+
+### 5) Merge overrides
+
+* Gantikan konten halaman `pages[p-1]` dengan hasil OCR untuk `p ∈ ocr_run_pages`.
+* Simpan gabungan ke **step2\_merge.txt** saat `--artifacts`.
+
+### 6) Meta schema (revisi/penambahan)
+
+Tambahkan bidang-bidang berikut (contoh):
+
+```json
+{
+  "doc_id": "pp362021",
+  "page_count": 75,
+  "timing_ms_per_page": [12, 15, ...],
+  "p95_latency_ms_per_page": 120,
+  "suspect_pages": [3,4,5,...],
+  "ocr": {
+    "enabled": true,
+    "ran": true,
+    "lang": "ind",
+    "psm": 4,
+    "oem": 1,
+    "dpi": 300,
+    "ocr_run_pages": [3,4,5,...],
+    "errors": [
+      {"page": 12, "stage": "pdftoppm", "reason": "no_output"},
+      {"page": 23, "stage": "tesseract", "reason": "exit_nonzero", "stderr_head": "..."},
+      {"page": 24, "stage": "tesseract", "reason": "empty_text_after_fallback"}
+    ],
+    "skipped_reason": null
+  },
+  "found": {"pasal": 0, "bab": 0, "menimbang": false, "mengingat": false, "penjelasan": false},
+  "stats": {
+    "removed_header": 0,
+    "removed_footer": 0,
+    "removed_lines_sample": []
+  },
+  "metrics": {
+    "character_coverage": 0.995,
+    "leak_rate": 0.0,
+    "split_violations": 0,
+    "coverage_pages": 1.0
+  },
+  "meta_fingerprint": "<sha256(meta_normalized)>",
+  "timestamps": {"started": "...", "finished": "..."}
+}
+```
+
+**Catatan:** `coverage_pages = 1 - ((|suspect|-|ocr_run|)/page_count)`. Bila `suspect_pages>0`, target `coverage_pages == 1.0`.
+
+### 7) Artefak OCR (saat `--artifacts=on`)
+
+* Simpan PNG per halaman di `output/<doc_id>/artifacts/ocr/page-{p}.png` (hanya halaman yang diproses).
+* Simpan `output/<doc_id>/artifacts/ocr_summary.txt` berisi tabel: `page | ppm_ok | tess_ok | chars | fallback_used | reason`.
+
+### 8) Flags CLI baru/dirapikan
+
+* `--with-ocr=on|off` (default `on` bila tesseract & pdftoppm terpasang; `off` bila tidak).
+* `--ocr-lang=ind` (opsi: `ind`, `ind+eng`).
+* `--ocr-psm=4` (opsi umum: 4, 6, 11, 12; dokumentasikan di README nanti).
+* `--ocr-oem=1`.
+* `--ocr-dpi=300`.
+* `--ocr-max-par=2` (pembatas paralelisme aman; default kecil agar RAM tidak jebol di PDF besar).
+* `--ocr-timeout-ms=45000` per halaman (kill proses yang menggantung; catat reason `timeout`).
+
+### 9) Check deps diperketat
+
+* Wajibkan `pdftoppm` selain `pdftotext`. Jika hilang → **fail\_fast\_with\_help**.
+
+---
+
+## Perubahan pada Acceptance Runner
+
+### 1) Idempotensi meta
+
+* Bandingkan `meta_fingerprint` (fallback: hash normalized meta bila fingerprint belum ada).
+
+### 2) Aturan OCR tegas
+
+* **OCRNoRunPages**: `suspect_pages>0` dan `len(ocr.ocr_run_pages)==0` → FAIL.
+* **CoveragePagesLow**: `suspect_pages>0` dan `coverage_pages<1.0` → FAIL.
+* Saat `--artifacts=on`: **jumlah file** `artifacts/ocr/page-*.png` \*\*≥ len(ocr\_run\_pages)`** → jika tidak, FAIL `OCRArtifactsMismatch\`.
+
+### 3) Sumber metrik
+
+* Ambil `page_count`, `p95_latency_ms_per_page`, `coverage_pages` dari meta.
+* Tabel laporan: `suspect_pages | ocr_run_pages | coverage_pages | p95_ms_per_page | meta_fp`.
+
+---
+
+## Delta prd.yaml (Machine Layer)
+
+Tambahkan/ubah skema `emit_files.meta` dan acceptance:
+
+```yaml
+outputs:
+  files: ["${doc_id}.md", "${doc_id}.meta.json"]
+
+acceptance_tests:
+  - name: "Acc-IdempotencyMeta"
+    assert: "meta_fingerprint run1 == meta_fingerprint run2"
+  - name: "Acc-OCR-Suspects"
+    assert: "suspect_pages>0 -> len(ocr.ocr_run_pages)>0 AND coverage_pages==1.0"
+```
+
+---
+
+## Quality Gates & Uji
+
+### Unit
+
+* Path builder `page-{p}.png` → benar untuk 1-based indeks.
+* Parser stderr tesseract → memotong ke 3 baris pertama.
+* Timeout guard.
+
+### Integrasi (minimal)
+
+* Fixture PDF image-scan 2–3 halaman (dummy) → `suspects>0`, `ocr_run_pages==suspects`, `coverage_pages==1.0`.
+* Fixture born-digital → `suspects==0`, OCR tidak dipanggil.
+
+### Manual reproduksi (triage cepat)
+
+```bash
+DOC=pp362021
+legalpdf2md --strict --with-ocr=on --artifacts=on --dump-steps ./input/pp/PP362021.pdf
+bat output/$DOC/$DOC.meta.json
+ls -lh output/$DOC/artifacts/ocr | head
+```
+
+---
+
+## Risiko & Mitigasi
+
+* **Kinerja**: OCR lambat di dokumen sangat panjang → batasi paralelisme; timeout per halaman; metrik p95 dilaporkan jelas.
+* **Ruang disk**: artefak PNG besar → hanya aktif saat `--artifacts=on`, bersihkan dengan `find ... -name 'page-*.png' -delete`.
+* **False negative OCR**: fallback `ind+eng`/`psm=6` satu kali; log reason di meta.
+* **Over-cleanup**: tidak ada perubahan aturan penghapusan isi di sini; semua langkah baru **non-destruktif**.
+
+---
+
+## Rollout & Rollback
+
+* **Rollout**: patch binary → patch acceptance → targeted rerun dokumen bermasalah → batch penuh.
+* **Rollback**: jika error rate >5% batch, kembalikan ke commit sebelumnya; artefak OCR tetap bisa digunakan untuk diagnosis.
