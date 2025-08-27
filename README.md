@@ -2,13 +2,13 @@
 
 > Legal PDF → Markdown yang deterministik, **taat struktur hukum**, dengan OCR terukur dan acceptance checks ketat.
 
-## Judul & Deskripsi Singkat
+## Deskripsi Singkat
 
-**legalpdf-to-md** mengubah PDF regulasi (lahir‑digital maupun hasil scan) menjadi Markdown yang bersih dan konsisten untuk RAG/QA hukum. Pipeline ini menjaga heading hukum (BAB, Pasal, Menimbang/Mengingat, PENJELASAN) sekaligus menekan noise seperti header/footer dan nomor halaman.
+**legalpdf-to-md** mengubah PDF regulasi (born‑digital maupun hasil scan) menjadi Markdown yang bersih dan konsisten untuk RAG/QA hukum. Pipeline ini menjaga heading hukum (BAB, Pasal, Menimbang/Mengingat, PENJELASAN) sekaligus menekan noise seperti header/footer dan nomor halaman.
 
 ## Badge
 
-[![GitHub](https://img.shields.io/github/license/yourusername/legalpdf-to-md)](https://github.com/rfxlamia/legalpdf-to-md/blob/main/LICENSE)
+[![GitHub](https://img.shields.io/github/license/rfxlamia/legalpdf-to-md)](https://github.com/rfxlamia/legalpdf-to-md/blob/main/LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-CLI-000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
